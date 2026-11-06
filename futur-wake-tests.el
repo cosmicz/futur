@@ -36,6 +36,9 @@
 
 (defvar futur-use-threads)
 (defvar futur--background)
+;; Special here even on a build without native compilation, so binding it
+;; stays dynamic and compiles without an unused-variable warning.
+(defvar native-comp-enable-subr-trampolines)
 (declare-function futur--funcall "futur" (&rest args))
 (declare-function futur-new "futur" (builder))
 (declare-function futur-bind "futur" (futur fun &optional error-fun))
@@ -126,12 +129,15 @@ timing verdict."
             ('nil (futur-wake-tests--timer-chain))
             ("drop-kick"
              (should (= 2 (length wake)))
-             (cl-letf (((symbol-function 'process-send-string)
-                        (lambda (process string)
-                          (if (memq process wake)
-                              (cl-incf dropped)
-                            (funcall send process string)))))
-               (futur-wake-tests--timer-chain)))
+             ;; Redefining a primitive would otherwise native-compile a
+             ;; trampoline, which needs a working compiler toolchain.
+             (let ((native-comp-enable-subr-trampolines nil))
+               (cl-letf (((symbol-function 'process-send-string)
+                          (lambda (process string)
+                            (if (memq process wake)
+                                (cl-incf dropped)
+                              (funcall send process string)))))
+                 (futur-wake-tests--timer-chain))))
             (_ (error "Unknown FUTUR_WAKE_TESTS_MUTANT %S" mutant)))))
     (pcase-let ((`(,delivered ,ran ,returned) result))
       (should delivered)
@@ -227,6 +233,8 @@ receiver's :remote contact is reported as a different endpoint.
 Return the warnings emitted, which are recorded instead of displayed."
   (let ((make (symbol-function 'make-network-process))
         (contact (symbol-function 'process-contact))
+        ;; As in the AC1 drop-kick mutant: no trampoline compilation.
+        (native-comp-enable-subr-trampolines nil)
         (made 0) (faked 0) (warnings nil))
     (cl-letf (((symbol-function 'make-network-process)
                (lambda (&rest args)
