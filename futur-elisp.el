@@ -1,0 +1,503 @@
+;;; futur-elisp.el --- A client to Futur's ELisp server  -*- lexical-binding: t -*-
+
+;; Copyright (C) 2026  Free Software Foundation, Inc.
+
+;; This program is free software; you can redistribute it and/or modify
+;; it under the terms of the GNU General Public License as published by
+;; the Free Software Foundation, either version 3 of the License, or
+;; (at your option) any later version.
+
+;; This program is distributed in the hope that it will be useful,
+;; but WITHOUT ANY WARRANTY; without even the implied warranty of
+;; MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+;; GNU General Public License for more details.
+
+;; You should have received a copy of the GNU General Public License
+;; along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+;;; Commentary:
+
+;;; Code:
+
+;; We use the following process properties:
+;;
+;; - `futur--kind': The "kind" of server.  Can be the symbols `futur-server'
+;;   or `futur-sandbox'.
+;; - `futur--parse-pending': The process's output that we have not yet parsed.
+;;   Can be a string or nil.
+;; - `futur--parse-state': The state of the parser of the process's output.
+;;   A symbol among:
+;;   - `:booting': we just started the process; waiting for first prompt.
+;;   - `:sexp': in the middle of receiving an sexp.
+;;   - `:next': waiting to read the prompt that precedes the next sexp.
+;; - `futur--parse-sexp-chunks': The chunks we have already received,
+;;   when reading a sexp.
+;; - `futur--sid': The SID of this process (a string " fes:HEX ").
+;; - `futur--sid-sym': The SID of this process (a symbol `fes:HEX').
+;; - `futur--parent': The parent process, used only for the auxiliary stderr
+;;   pipe processes.
+;; - `futur--destination': the future to which to send the next result.
+;; - `futur--last-time': The (float) time of the last interaction.
+;; - `futur--last-sexp': The car of the last received sexp.
+;; - `futur--answers': List of answers we have already received
+;;   but whose destination futures have not yet arrived.
+;; - `futur--ready': Boolean indicating if a process is ready to receive
+;;   some new homework.
+;; - `futur--rid': The current request ID, a natural number.
+
+(require 'trace)
+;; (trace-function 'futur-elisp--process-filter)
+;; (trace-function 'futur-elisp--process-answer)
+;; (trace-function 'process-send-region)
+;; (trace-function 'process-send-string)
+;; (trace-function 'futur--funcall)
+;; (trace-function 'futur-elisp--get-process)
+;; (trace-function 'futur-elisp--funcall)
+;; (trace-function 'futur-elisp-sandbox--funcall)
+
+(require 'futur)
+
+(defconst futur-elisp--impossible-string "\n# \"# "
+  "String that will necessarily cause `read' to signal an error.
+This has to be the same used by `futur-server'.")
+
+(defvar futur-elisp--servers nil
+  "Alist mapping server kinds to lists of processes.
+A server kind is a symbol.")
+
+(defvar futur-elisp--servers-delay (* 60 10)
+  "Number of seconds after which an inactive server is killed.")
+
+(defvar futur-elisp--servers-timer nil)
+
+(defun futur-elisp--process-filter (proc string)
+  (cl-assert (process-get proc 'futur--kind))
+  (cl-assert (memq proc (assq (process-get proc 'futur--kind)
+                              futur-elisp--servers)))
+  (let ((pending (process-get proc 'futur--parse-pending))
+        (case-fold-search nil))
+    (process-put proc 'futur--parse-pending nil)
+    (named-let loop ((string (if pending (concat pending string) string)))
+      ;; (trace-values :looping (process-get proc 'futur--parse-state) string)
+      (pcase-exhaustive (process-get proc 'futur--parse-state)
+        (:booting
+         (if (not (string-match " \\(fes:[0-9a-f]+\\) " string))
+             (process-put proc 'futur--parse-pending string)
+           (let ((before (string-trim
+                          (substring string 0 (match-beginning 0)))))
+             (unless (equal "" before)
+               (message "Skipping output from futur-server: %S" before)))
+           (process-put proc 'futur--sid (match-string 0 string))
+           (process-put proc 'futur--sid-sym (intern (match-string 1 string)))
+           (process-put proc 'futur--parse-state :sexp)
+           (process-put proc 'futur--parse-sexp-chunks nil)
+           (when (< (match-end 0) (length string))
+             (loop (substring string (match-end 0))))))
+        (:sexp
+         (when pending
+           (cl-assert (< (length pending)
+                         (length futur-elisp--impossible-string))))
+         (if (not (string-match "\n" string))
+             (push string (process-get proc 'futur--parse-sexp-chunks))
+           (unless (eq 0 (match-beginning 0))
+             (push (substring string 0 (match-beginning 0))
+                   (process-get proc 'futur--parse-sexp-chunks))
+             (setq string (substring string (match-beginning 0))))
+           ;; (trace-values :sexp string)
+           (cond
+            ((string-prefix-p futur-elisp--impossible-string string)
+             (let* ((pendings (process-get proc 'futur--parse-sexp-chunks))
+                    (sexp-string (mapconcat #'identity (nreverse pendings) "")))
+               (process-put proc 'futur--parse-sexp-chunks nil)
+               (process-put proc 'futur--parse-state :next)
+               (futur--funcall #'futur-elisp--process-answer proc sexp-string)
+               (when (< (length futur-elisp--impossible-string) (length string))
+                 ;; (trace-values :loop1)
+                 (loop (substring string
+                                  (length futur-elisp--impossible-string))))))
+            ((< (length string) (length futur-elisp--impossible-string))
+             (process-put proc 'futur--parse-pending string))
+            ((string-match "\n" string 1)
+             (push (substring string 0 (match-beginning 0))
+                   (process-get proc 'futur--parse-sexp-chunks))
+             ;; (trace-values :loop2)
+             (loop (substring string (match-beginning 0))))
+            (t (push string (process-get proc 'futur--parse-sexp-chunks))))))
+        (:next
+         (let ((sid (process-get proc 'futur--sid)))
+           (when pending
+             (cl-assert (< (length pending) (length sid))))
+           (cond
+            ((string-match sid string)
+             (let ((after (substring string (match-end 0)))
+                   (before (string-trim
+                            (substring string 0 (match-beginning 0)))))
+               (unless (equal "" before)
+                 (message "Skipping output from futur-server: %S" before))
+               (process-put proc 'futur--parse-state :sexp)
+               ;; (trace-values :loop3 before sid after)
+               (loop after)))
+            (t
+             (string-match "[ :0-9a-fs]*\\'" string ;; This regexp Can't fail.
+                           (max 0 (- (length string) (length sid))))
+             (let ((after (substring string (match-beginning 0)))
+                   (before (string-trim
+                            (substring string 0 (match-beginning 0)))))
+               (unless (equal "" before)
+                 (message "Skipping output from futur-server: %S" before))
+               (process-put proc 'futur--parse-pending after)))))))))
+  nil)
+
+(defun futur-elisp--process-filter-stderr (proc string)
+  (let ((pending (process-get proc 'futur--parse-pending)))
+    (while (string-match "\n" string)
+      (let* ((head (substring string 0 (match-beginning 0)))
+             (tail (substring string (match-end 0)))
+             (line (if pending (concat pending head) head))
+             (parent (process-get proc 'futur--parent))
+             (kind (if parent (process-get parent 'futur--kind) 'orphan)))
+        (unless (equal line "")
+          (message "%s: %S" (or kind 'futur-unknown-kind) line))
+        (setq pending nil)
+        (setq string tail)))
+    (process-put proc 'futur--parse-pending
+                 (if pending (concat pending string) string))))
+
+(defun futur-elisp--process-sentinel (proc status)
+  (let* ((proclist (assq (process-get proc 'futur--kind)
+                         futur-elisp--servers)))
+    (cl-assert (memq proc (cdr proclist)))
+    (if (not (futur--process-completed-p proc))
+        (message "futur-elisp--process-sentinel before end: %S" status)
+      (cl-callf (lambda (ps) (delq proc ps)) (cdr proclist))
+      (when (and (null (cdr proclist))
+             (eq 'futur-sandbox (process-get proc 'futur--kind)))
+        (futur-elisp-sandbox--delete-temp-dir))
+      (let ((futur (process-get proc 'futur--destination)))
+        (when futur
+          (process-put proc 'futur--destination nil)
+          (futur-deliver-failure futur (list 'error "Futur-server died")))))
+    nil))
+
+(defvar futur-elisp--include-extra-debug-info nil)
+
+(defun futur-elisp--launch (kind &optional prefix)
+  (let* ((buffer (get-buffer-create (format" *%s*" kind)))
+         (stderr (make-pipe-process
+                  :name (format "%s-stderr" kind)
+                  :noquery t
+                  :coding 'emacs-internal
+                  :buffer buffer
+                  :filter #'futur-elisp--process-filter-stderr
+                  :sentinel #'ignore))
+         (proc (make-process
+                :name (symbol-name kind)
+                :noquery t
+                :buffer buffer
+                :connection-type 'pipe
+                :coding 'emacs-internal
+                :stderr stderr
+                :filter #'futur-elisp--process-filter
+                :sentinel #'futur-elisp--process-sentinel
+                :command
+                `(,@prefix
+                  ,(expand-file-name invocation-name invocation-directory)
+                  "-Q" "--batch"
+                  ,@(when futur-elisp--include-extra-debug-info
+                      '("--eval" "(setq futur-server-include-backtraces t)"))
+                  "-l" ,(locate-library "futur-server")
+                  "-f" "futur-server"))))
+    (process-put stderr 'futur--parent proc)
+    (process-put proc 'futur--kind kind)
+    (process-put proc 'futur--parse-state :booting)
+    (process-put proc 'futur--rid 0)
+    (process-put proc 'futur--last-time (float-time))
+    (push proc (alist-get kind futur-elisp--servers))
+    (unless futur-elisp--servers-timer
+      (setq futur-elisp--servers-timer
+            (run-with-timer futur-elisp--servers-delay
+                            futur-elisp--servers-delay
+                            #'futur-elisp--reap-idle-servers)))
+    proc))
+
+(defun futur-elisp--reap-idle-servers ()
+  (let ((time (float-time))
+        (left nil))
+    (pcase-dolist (`(,_kind . ,procs) futur-elisp--servers)
+      (dolist (proc procs)
+        (if (> (- time (process-get proc 'futur--last-time))
+               futur-elisp--servers-delay)
+            ;; No activity in during more than `futur-elisp--servers-delay'.
+            ;; FIXME: Maybe we should use different delays for the case
+            ;; where the server is really idle, or the case where we're
+            ;; waiting for an answer?
+            (delete-process proc)
+          (setq left t))))
+    (unless left
+      (cancel-timer futur-elisp--servers-timer)
+      (setq futur-elisp--servers-timer nil))))
+
+(defun futur-elisp--process-answer (proc sexp-string)
+  (process-put proc 'futur--last-time (float-time))
+  (pcase-let* ((`(,sexp . ,end)
+                (condition-case err
+                         (read-from-string sexp-string)
+                  (error `((:unreadable-answer ,err
+                            ,@(when futur-elisp--include-extra-debug-info
+                                (list sexp-string)))
+                           . ,(length sexp-string)))))
+               (sexp (if (string-match "[^ \n\t]" sexp-string end)
+                         `(:trailing-garbage ,sexp ,(substring sexp-string end))
+                       sexp))
+               (futur (process-get proc 'futur--destination)))
+    (process-put proc 'futur--last-sexp (or (car-safe sexp) sexp))
+    (if (null futur)
+        ;; Hopefully, some destination will show up later to consume it.
+        (process-put proc 'futur--answers
+                     (nconc (process-get proc 'futur--answers) (list sexp)))
+      (process-put proc 'futur--destination nil)
+      (futur-deliver-value futur sexp))
+    nil))
+
+(defun futur-elisp--set-destination (proc futur)
+  (cl-assert (null (process-get proc 'futur--destination)) nil
+             "Pre-existing destination %S vs new %S"
+             (process-get proc 'futur--destination) futur)
+  (let ((answers (process-get proc 'futur--answers)))
+    (if answers
+        (let ((answer (car answers)))
+          (process-put proc 'futur--answers (cdr answers))
+          (futur-deliver-value futur answer)
+          nil)
+      (process-put proc 'futur--destination futur)
+      nil)))
+
+(defun futur-elisp--answer-futur (proc)
+  (futur-new (lambda (futur)
+               (futur-elisp--set-destination proc futur))))
+
+(defun futur-elisp--get-process (kind launcher initial-context continuation)
+  (let* ((ready (seq-filter (lambda (proc) (process-get proc 'futur--ready))
+                            (alist-get kind futur-elisp--servers)))
+         (favorite (seq-find (lambda (proc)
+                               (member (if (consp initial-context)
+                                           (car initial-context)
+                                         initial-context)
+                                       (process-get proc 'futur--contexts)))
+                             ready)))
+    (if ready (funcall continuation (or favorite (car ready)))
+      ;; Let's start a new subprocess.
+      ;; If our caller gets aborted before the subprocess is ready,
+      ;; we don't want to abort the subprocess' startup since we'll just
+      ;; keep it around in case someone else wants to use it.
+      (futur-catch-abort
+       #'ignore
+       (futur-let*
+           ((proc (funcall launcher kind))
+            (answer <- (futur-elisp--answer-futur proc)))
+         (if (eq answer :ready)
+             (progn
+               (process-put proc 'futur--ready t)
+               (funcall continuation proc))
+           (error "Unexpected boot message from futur-server: %S" answer)))))))
+
+(define-error 'futur-unreadable-answer "Unreadable answer from server")
+
+(defun futur-elisp--print-readably (sexp)
+  (let ((print-length nil)
+        (print-level nil)
+        (print-circle t)
+        (print-gensym t)
+        ;; The server reads with `read-from-minibuffer' which
+        ;; works only on single-lines, so it's super-important
+        ;; we don't include any LF by accident.
+        (print-escape-newlines t)
+        ;; Not only LF but also CR terminates the single line :-(
+        (print-escape-control-characters t)
+        ;; SWP aren't currently printed in a `read'able way, so we may
+        ;; as well print them bare.
+        (print-symbols-bare t))
+    (prin1 sexp (current-buffer))
+    (when futur-elisp--include-extra-debug-info
+      ;; Check that what we send is `read'able, so we get a better
+      ;; backtrace then when it's detected by the server.
+      (goto-char (point-min))
+      (condition-case err
+          (read (current-buffer))
+        (error
+         (error "[Futur] Trying to send un`read'able data: %S" err))))))
+
+(defun futur--elisp-abort-handler (proc)
+  (lambda (_error)
+    (cond
+     ;; `bwrap' just exits when we send SIGINT or SUGUSR1 instead of
+     ;; propagating the signal to the underlying subprocess, leaving
+     ;; the Emacs process running, so better do nothing.  🙁
+     ;; FIXME: Maybe dig into the process tree to find the PID of the
+     ;; `emacs' subprocess underneath the `brwap' process(es)?
+     ;; We can't ask the sandbox to tell us its PID because it
+     ;; always thinks it doesn't know it (it's told it's process 2).
+     ((eq (process-get proc 'futur--kind) 'futur-sandbox) nil)
+     ((boundp 'kill-emacs-on-sigint) (interrupt-process proc)) ;Emacs-31
+     (t (signal-process proc 'USR1)))))
+
+(defun futur-elisp--funcall-1 (proc initial-context func args)
+  (cl-assert (process-get proc 'futur--ready))
+  (cl-pushnew initial-context (process-get proc 'futur--contexts))
+  (futur-catch-abort
+   ;; Upon abortion, tell the subprocess to interrupt the current job,
+   ;; but without aborting the protocol so we stay in sync and the
+   ;; subprocess can be reused as intended.
+   (futur--elisp-abort-handler proc)
+   (futur-let*
+       ((rid
+         ;; FIXME: In Emacs<31, cl-incf on process-get doesn't return
+         ;; the expected value.
+         ;; (cl-incf (process-get proc 'futur--rid))
+         (progn
+           (cl-incf (process-get proc 'futur--rid))
+           (process-get proc 'futur--rid)))
+        (_ (with-temp-buffer
+             ;; (trace-values :funcall rid func args)
+             (declare-function futur-reset-context "futur-server" (name target))
+             (process-put proc 'futur--ready nil)
+             (process-put proc 'futur--last-time (float-time))
+             (futur-elisp--print-readably
+              `(,(process-get proc 'futur--sid-sym) ,rid
+                . ,(if (consp initial-context)
+                       `(,(lambda ()
+                            (apply #'futur-reset-context initial-context)
+                            (apply func args)))
+                     `(,func ,@args))))
+             (cl-assert (eobp))
+             (insert "\n")
+             (let ((coding-system-for-write 'emacs-internal))
+               (process-send-string proc (buffer-string))
+               ;; (process-send-region proc (point-min) (point-max))
+               )))
+        (read-answer <- (futur-elisp--answer-futur proc)))
+     ;; (trace-values :read-answer read-answer)
+     (pcase read-answer
+       (`(:read-success ,(pred (equal rid)))
+        (futur-let* ((call-answer  <- (futur-elisp--answer-futur proc)))
+          (process-put proc 'futur--ready t)
+          ;; (trace-values :call-answer call-answer)
+          (pcase-exhaustive call-answer
+            (`(:funcall-success ,(pred (equal rid)) . ,val)
+             val)
+            (`(:funcall-error ,(pred (equal rid)) . ,err)
+             (when (stringp (car err)) ;The error is preceded by a backtrace.
+               ;; (message "[Futur] Received error with backtrace: %S\n%s"
+               ;;          (cdr err) (car err))
+               (setq err (nconc (cdr err) (list (car err)))))
+             (futur--resignal err))
+            (`(:unreadable-answer . ,err-data)
+             ;; FIXME: Maybe we should report the whole unreadable string?
+             ;; FIXME: A "common" case is when an error includes un`read'able
+             ;; data, like a buffer, in which case we could convert
+             ;; the error to a `read'able one in `futur-server.el'?
+             (signal 'futur-unreadable-answer err-data)))))
+       (`(:read-success . ,_)
+        ;; (futur--funcall #'futur--client-resync proc)
+        (error "[Futur] Out-of-order reply: %S" read-answer))
+       (_
+        ;; (futur--funcall #'futur--client-resync proc)
+        (error "[Futur] error: %S" read-answer))))))
+
+(defun futur-elisp-funcall (initial-context func &rest args)
+  "Call FUNC with arguments ARGS like `funcall' but in a subprocess.
+This thus runs concurrently with the main process.
+FUNC, ARGS, as well as the return value have to be printable `read'ably,
+which means that they cannot contain values like markers, overlays,
+processes, buffers, ...
+Because it runs in a subprocess, FUNC cannot interact with the user,
+nor can it access the main process' buffers.
+INITIAL-CONTEXT describes the desired state of the Emacs subprocess and is
+used to prefer a subprocess that already used that same context,
+to try and reduce startup time.  It can be:
+- a plain symbol, in which case there is no guarantee about the state
+  of the Emacs subprocess in which FUNC is called.
+- a list of arguments that are passed to `futur-reset-context' before
+  calling FUNC."
+  (futur-elisp--get-process
+   'futur-server #'futur-elisp--launch initial-context
+   (lambda (proc) (futur-elisp--funcall-1 proc initial-context func args))))
+
+;;;; Running in a sandbox
+
+;; Inspired by the code in `elpa-admin.el'.
+
+(defconst futur-elisp-sandbox--bwrap-args
+  '("--unshare-all"
+    "--dev" "/dev"
+    "--proc" "/proc"
+    "--tmpfs" "/tmp"))
+
+(defvar futur-elisp-sandbox--ro-dirs
+  '("/lib" "/lib64" "/bin" "/usr" "/etc/alternatives" "/etc/emacs" "/gnu" "~/"))
+
+(defvar futur-elisp-sandbox--temp-dir nil)
+
+(defun futur-elisp-sandbox-temp-dir ()
+  "Return the directory to pass temporary files to the sandbox.
+Contrary to /tmp, this directory is readable by the sandboxed processes."
+  (if (and futur-elisp-sandbox--temp-dir
+           (file-directory-p futur-elisp-sandbox--temp-dir))
+      futur-elisp-sandbox--temp-dir
+    (when futur-elisp-sandbox--temp-dir
+      ;; The directory has disappeared.  That's worrisome, because it
+      ;; probably means some malicious process could put something else there.
+      ;; There's not much we can do now, other than stop using it.
+      ;; And the old sandboxes can't be used any more, so kill them.
+      ;; (ideally, we'd wait for them to stop processing their current
+      ;; request, but it seems more trouble than it's worth).
+      (dolist (proc (alist-get 'futur-sandbox futur-elisp--servers))
+        (kill-process proc))
+      (setf (alist-get 'futur-sandbox futur-elisp--servers) nil))
+    (setq futur-elisp-sandbox--temp-dir
+          (make-temp-file "futur-sandbox" 'dir))))
+
+(defun futur-elisp-sandbox--delete-temp-dir ()
+  (when futur-elisp-sandbox--temp-dir
+    (when (file-directory-p futur-elisp-sandbox--temp-dir)
+      (delete-directory futur-elisp-sandbox--temp-dir 'recursive))
+    (setq futur-elisp-sandbox--temp-dir nil)))
+
+(defun futur-elisp-sandbox--launch (kind)
+  ;; Don't inherit MAKEFLAGS from any surrounding make process,
+  ;; nor TMP/TMPDIR since the container uses its own tmp dir.
+  (let ((process-environment `("MAKEFLAGS" "TMP" "TMPDIR"
+                               ,@process-environment)))
+    (futur-elisp--launch
+     kind `("bwrap"
+            ,@futur-elisp-sandbox--bwrap-args
+            ,@(mapcan (lambda (dir)
+                        (when (file-exists-p dir)
+                          (let ((dir (expand-file-name dir)))
+                            `("--ro-bind" ,dir ,dir))))
+                      (append futur-elisp-sandbox--ro-dirs
+                              (list (futur-elisp-sandbox-temp-dir))))))))
+
+(defun futur-elisp-sandbox-funcall (initial-context func &rest args)
+  "Like `futur-elisp--funcall' but runs in a sandbox.
+Sandbox here means that FUNC cannot write to any file nor make network
+connections and if it spawns subprocesses those same restrictions apply
+to the subprocesses.
+This makes it safe to use even when FUNC or ARGS are untrustworthy.
+But DO NOT TRUST the returned result: even if FUNC and ARGS happen to
+be well-behaved, they could be compromised by previous calls
+to `futur-elisp-sandbox--funcall'."
+  (futur-elisp--get-process
+   'futur-sandbox #'futur-elisp-sandbox--launch initial-context
+   (lambda (proc) (futur-elisp--funcall-1 proc initial-context func args))))
+
+(defun futur-elisp--kill-subprocesses ()
+  (interactive)
+  (futur-elisp-sandbox--delete-temp-dir)
+  (pcase-dolist (`(_kind . ,procs) futur-elisp--servers)
+    (mapc #'delete-process procs)))
+
+(add-hook 'kill-emacs-hook #'futur-elisp--kill-subprocesses)
+
+(provide 'futur-elisp)
+;;; futur-elisp.el ends here

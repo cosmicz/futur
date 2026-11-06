@@ -1,0 +1,59 @@
+Since 2.0:
+
+- Fix issues found when using timers instead of threads.
+- Tell Flymake that our sandboxed `elisp-flymake-byte-compile' is safe.
+
+Version 2.0:
+
+- New functions `futur-elisp-funcall' and `futur-elisp-sandbox-funcall'
+  to run ELisp code concurrently in subprocesses.
+- Better support for aborting futur-elisp subprocesses.
+- New function `futur-catch-abort'.
+- New function `futur-dbus-call-method'.
+
+Version 1.5:
+
+- New synchronization objects: full/empty cells and semaphores.
+- New type for "mines" used internally for synchronization objects.
+- Emit warnings for unused (non-nil) return values.
+- New debug var `futur-elisp--include-extra-debug-info'.
+- `futur-client.el' is now called `futur-elisp.el'.
+
+Version 1.4:
+
+- `:error-fun' renamed to `on-error' in `futur-let*'.
+- New function `futur-register-unwind-protect`.
+- `futur-hacks-mode' now also makes `byte-compile-file' asynchronous.
+- Bug fixes.
+
+Version 1.3:
+
+- Syntax of `:error-fun' changed in `futur-let*'.
+- Remove `idle' argument from `futur-timeout'.
+- Adjusted `futur-hacks-mode' to changes in Emacs `master'.
+
+Version 1.2:
+
+- `futur-abort' takes a second argument (the reason for the abortion).
+- New function `futur-funcall'.
+- `futur-bind' and `futur-blocking-wait-to-get-result' can now select
+  which errors they catch.
+- New function `futur-p'.
+- Preliminary support to run ELisp code in subproceses&sandboxes.
+- Experimental `futur-hacks-mode' using the preliminary sandbox code.
+- New var `futur-use-threads' to be able to force the use of timers.
+
+Version 1.1:
+
+- New functions: `futur-race', `futur-sit-for', `futur-url-retrieve'.
+- New function `futur-concurrency-bound' when you need to limit concurrency.
+- Rename `futur-error' to `futur-failed'.
+- Rename `futur-register-callback' to `futur--register-callback'.
+- Rename `futur-ize' to `futur--ize'.
+- Fix compatibility with Emacs<31.
+- Minor bug fixes.
+
+Version 1.0:
+
+- After years of sitting in the dark, it's finally getting dusted up for
+  a release.

@@ -1,0 +1,2 @@
+;; Generated package description from futur.el  -*- no-byte-compile: t; lexical-binding:t -*-
+(define-package "futur" "2.1" "Future/promise-based async library" '((emacs "27.1")) :commit "aca9a958ff533122eef4e22721471263389eccc4" :authors '(("Stefan Monnier" . "monnier@iro.umontreal.ca")) :maintainer '("Stefan Monnier" . "monnier@iro.umontreal.ca") :keywords '("concurrency" "async" "promises" "futures") :url "https://elpa.gnu.org/packages/futur.html")
