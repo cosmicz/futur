@@ -109,9 +109,15 @@ The fixture adds no other timer, no polling and no idle hook."
 (ert-deftest futur-wake/ac1-timer-enqueued-continuation ()
   "A continuation enqueued from a timer runs within 50 ms (AC1).
 With FUTUR_WAKE_TESTS_MUTANT=drop-kick the wake byte is never written,
-so the same assertion must fail (AC2)."
+so the same assertion must fail (AC2).  The S0F3-AC1 line is printed
+only after the run's prerequisites hold (the timer delivered; with the
+mutant, the pair existed and exactly FUTUR_WAKE_TESTS_EXPECT_DROPPED
+writes, default 1, were dropped), so a failure before it is never the
+timing verdict."
   (futur-wake-tests--load)
   (let* ((mutant (getenv "FUTUR_WAKE_TESTS_MUTANT"))
+         (expect-dropped
+          (string-to-number (or (getenv "FUTUR_WAKE_TESTS_EXPECT_DROPPED") "1")))
          (wake (futur-wake-tests--named "futur-wake"))
          (dropped 0)
          (send (symbol-function 'process-send-string))
@@ -127,14 +133,14 @@ so the same assertion must fail (AC2)."
                             (funcall send process string)))))
                (futur-wake-tests--timer-chain)))
             (_ (error "Unknown FUTUR_WAKE_TESTS_MUTANT %S" mutant)))))
-    (pcase-let* ((`(,delivered ,ran ,returned) result)
-                 (shape (futur-wake-tests--report
-                         (format "S0F3-AC1 mutant=%s dropped=%d"
-                                 (or mutant "none") dropped)
-                         delivered ran returned)))
+    (pcase-let ((`(,delivered ,ran ,returned) result))
       (should delivered)
-      (when mutant (should (= dropped 1)))
-      (should (eq shape 'prompt)))))
+      (when mutant (should (= dropped expect-dropped)))
+      (let ((shape (futur-wake-tests--report
+                    (format "S0F3-AC1 mutant=%s dropped=%d"
+                            (or mutant "none") dropped)
+                    delivered ran returned)))
+        (should (eq shape 'prompt))))))
 
 ;;; ─── AC3/AC5: controls on both backends ───────────────────────────
 
