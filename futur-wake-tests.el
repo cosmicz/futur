@@ -215,25 +215,42 @@ so the same assertion must fail (AC2)."
 
 (defun futur-wake-tests--load-failing (failing-step)
   "Load futur with FAILING-STEP of the wake setup made to fail.
-FAILING-STEP is `listener' or `sender'.  Return the warnings emitted,
-which are recorded instead of displayed."
+FAILING-STEP is `listener' or `sender', where `make-network-process'
+signals, or `peer', where the real pair is made and only the accepted
+receiver's :remote contact is reported as a different endpoint.
+Return the warnings emitted, which are recorded instead of displayed."
   (let ((make (symbol-function 'make-network-process))
-        (warnings nil))
+        (contact (symbol-function 'process-contact))
+        (made 0) (faked 0) (warnings nil))
     (cl-letf (((symbol-function 'make-network-process)
                (lambda (&rest args)
                  (if (eq (if (plist-get args :server) 'listener 'sender)
                          failing-step)
                      (signal 'file-error (list "s0f3 forced failure" failing-step))
+                   (cl-incf made)
                    (apply make args))))
+              ((symbol-function 'process-contact)
+               (lambda (process &optional key &rest rest)
+                 (if (and (eq failing-step 'peer) (eq key :remote)
+                          (string-prefix-p "futur-wake-receiver "
+                                           (process-name process)))
+                     (progn (cl-incf faked) [127 0 0 1 1])
+                   (apply contact process key rest))))
               ((symbol-function 'display-warning)
                (lambda (&rest args) (push args warnings))))
       (futur-wake-tests--load)
+      (when (eq failing-step 'peer)
+        ;; All three endpoints existed: listener and sender were made,
+        ;; and the accepted receiver's peer was consulted.
+        (should (= 2 made))
+        (should (<= 1 faked)))
       (should-not (futur-wake-tests--named "futur-wake"))
       (should (= 1 (length (futur-wake-tests--named "futur-bug80468"))))
       (futur--funcall #'ignore)
       (futur--funcall #'ignore)
       (accept-process-output nil 0.05))
-    (princ (format "S0F3-AC4 failing=%s warnings=%S\n" failing-step warnings))
+    (princ (format "S0F3-AC4 failing=%s made=%d faked=%d warnings=%S\n"
+                   failing-step made faked warnings))
     warnings))
 
 (ert-deftest futur-wake/ac4-pair-shape ()
@@ -258,6 +275,15 @@ which are recorded instead of displayed."
 (ert-deftest futur-wake/ac4-sender-fails ()
   "No sender: the listener is deleted, one fallback process, one warning."
   (should (= 1 (length (futur-wake-tests--load-failing 'sender)))))
+
+(ert-deftest futur-wake/ac4-wrong-peer ()
+  "A wrong peer is rejected after all three endpoints existed.
+None survives, one fallback process and one warning remain, and
+unloading restores the pre-load process baseline."
+  (let ((baseline (process-list)))
+    (should (= 1 (length (futur-wake-tests--load-failing 'peer))))
+    (unload-feature 'futur t)
+    (should-not (cl-set-exclusive-or baseline (process-list)))))
 
 (ert-deftest futur-wake/ac4-unload-pair ()
   "Unloading futur from the pair state leaves no process behind."
