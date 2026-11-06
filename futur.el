@@ -194,14 +194,79 @@ and limitations.")
   (when futur-use-threads
     (futur--make-thread #'futur--background "futur--background")))
 
+(defvar futur--wake-receiver nil
+  "The receiving end of the wake pair made by `futur--wake-pair', if any.")
+
+(defun futur--wake-pair ()
+  "Make a loopback socket pair to wake a blocked wait.
+Return the sending end and keep the receiving end in `futur--wake-receiver'.
+Both ends belong to the current thread.  Signal an error, leaving no
+endpoint behind, if the pair cannot be made or its peer is not the sender."
+  (let ((listener nil) (sender nil) (receiver nil) (done nil))
+    (unwind-protect
+        (progn
+          ;; Accepted connections are named after the listener.
+          (setq listener
+                (make-network-process
+                 :name "futur-wake-receiver" :server t :host "127.0.0.1"
+                 :family 'ipv4 :service t :noquery t :coding 'binary
+                 :filter #'ignore :sentinel #'ignore
+                 :log (lambda (server child _message)
+                        (when (and child (not receiver))
+                          (setq receiver child)
+                          (delete-process server)))))
+          (setq sender
+                (make-network-process
+                 :name "futur-wake-sender" :host "127.0.0.1" :family 'ipv4
+                 :service (process-contact listener :service)
+                 :noquery t :coding 'binary :filter #'ignore :sentinel #'ignore))
+          (let ((end (+ (float-time) 2)))
+            (while (and (not receiver) (< (float-time) end))
+              (accept-process-output nil 0.01)))
+          (unless receiver
+            (error "No connection to the wake listener"))
+          (unless (equal (process-contact receiver :remote) (process-contact sender :local))
+            (error "The wake listener accepted another peer"))
+          (set-process-filter receiver #'ignore)
+          (set-process-sentinel receiver #'ignore)
+          (setq futur--wake-receiver receiver)
+          (setq done t)
+          sender)
+      (unless done
+        (dolist (proc (list sender receiver listener))
+          (when (and proc (process-live-p proc)) (delete-process proc)))))))
+
 (defconst futur--proc-bug80468
-  ;; Create dummy process so we can force re-consulting the list of timers
-  ;; by causing some process output.
+  ;; Create a process whose output forces re-consulting the list of timers,
+  ;; so a timer added while timers run is not left waiting (bug#80468).
+  ;; A loopback socket pair carries the byte everywhere.  A nil-program
+  ;; process does not on darwin: its PTY's slave has ECHO cleared, so the
+  ;; written newline never comes back as output.  Keep that process only
+  ;; as the fallback when the pair cannot be made.
   (unless futur-use-threads
-    (let ((proc (start-process "futur-bug80468" nil nil)))
-      (set-process-filter proc #'ignore)
-      (set-process-sentinel proc #'ignore)
-      proc)))
+    (condition-case err
+        (futur--wake-pair)
+      (error
+       (display-warning
+        'futur
+        (format-message "No loopback wake (%S); using a PTY process, which does not wake timers on every system"
+                        err))
+       (let ((proc (start-process "futur-bug80468" nil nil)))
+         (set-process-filter proc #'ignore)
+         (set-process-sentinel proc #'ignore)
+         proc)))))
+
+(defun futur--wake-close ()
+  "Delete the processes that wake a blocked wait."
+  (dolist (proc (list futur--proc-bug80468 futur--wake-receiver))
+    (when (processp proc) (delete-process proc)))
+  (setq futur--wake-receiver nil))
+
+(defun futur-unload-function ()
+  "Delete futur's wake processes when futur is unloaded."
+  (futur--wake-close)
+  ;; Continue with the standard unloading.
+  nil)
 
 (defvar futur--pending (futur--queue)
   "Pending operations.")
